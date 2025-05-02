@@ -1,11 +1,13 @@
-;; Stage 2: Enhanced marketplace with offer functionality
+;; Complete marketplace with payment and refund features
 (define-constant ADMIN tx-sender)
 (define-constant ERROR-NOT-PERMITTED (err u403))
 (define-constant ERROR-ITEM-NOT-FOUND (err u404))
 (define-constant ERROR-BIDDING-ENDED (err u405))
 (define-constant ERROR-BID-TOO-LOW (err u406))
 (define-constant ERROR-SALE-IN-PROGRESS (err u407))
+(define-constant ERROR-PAYMENT-FAILED (err u408))
 (define-constant ERROR-BAD-INPUT (err u409))
+(define-constant ERROR-BAD-IDENTIFIER (err u410))
 
 ;; Status codes for marketplace items
 (define-constant STATUS-DRAFT u0)
@@ -43,6 +45,12 @@
     amount: uint,
     block-height: uint
   }
+)
+
+;; Refund tracking
+(define-map refunds
+  { listing-id: uint, buyer: principal }
+  { value: uint }
 )
 
 ;; Listing counter
@@ -203,6 +211,59 @@
   )
 )
 
+;; Complete a sale
+(define-public (complete-sale 
+  (listing-id uint)
+  (current-block uint)
+)
+  (begin
+    ;; Verify listing exists
+    (asserts! (listing-exists? listing-id) ERROR-ITEM-NOT-FOUND)
+    
+    (let 
+      (
+        (listing (unwrap! 
+          (map-get? listings { listing-id: listing-id }) 
+          ERROR-ITEM-NOT-FOUND
+        ))
+        (winning-buyer 
+          (unwrap! (get top-buyer listing) ERROR-ITEM-NOT-FOUND)
+        )
+        (validated-id listing-id)
+      )
+      ;; Verify listing has ended
+      (asserts! 
+        (>= current-block (get close-block listing)) 
+        ERROR-SALE-IN-PROGRESS
+      )
+      (asserts! 
+        (is-eq (get status listing) STATUS-LIVE) 
+        ERROR-BIDDING-ENDED
+      )
+
+      ;; Mark as completed
+      (map-set listings
+        { listing-id: validated-id }
+        (merge listing {
+          status: STATUS-FINISHED,
+          final-price: (get top-offer listing)
+        })
+      )
+
+      ;; Process payment to seller
+      (try! (as-contract 
+        (stx-transfer? 
+          (get top-offer listing)
+          tx-sender 
+          (get seller listing)
+        )
+      ))
+
+      (ok true)
+    )
+  )
+)
+
 ;; Start accepting offers
 (define-public (open-for-offers 
   (listing-id uint)
@@ -248,6 +309,47 @@
   )
 )
 
+;; Request refund for outbid offer
+(define-public (request-refund (listing-id uint))
+  (begin
+    ;; Verify listing exists
+    (asserts! (listing-exists? listing-id) ERROR-ITEM-NOT-FOUND)
+    
+    (let 
+      (
+        (offer (unwrap! 
+          (map-get? offers { listing-id: listing-id, buyer: tx-sender }) 
+          ERROR-ITEM-NOT-FOUND
+        ))
+        (listing (unwrap! 
+          (map-get? listings { listing-id: listing-id }) 
+          ERROR-ITEM-NOT-FOUND
+        ))
+        (validated-id listing-id)
+      )
+      ;; Verify not top offer
+      (asserts! 
+        (not (is-eq 
+          (some tx-sender) 
+          (get top-buyer listing)
+        )) 
+        ERROR-NOT-PERMITTED
+      )
+
+      ;; Return funds
+      (try! (as-contract 
+        (stx-transfer? 
+          (get amount offer)
+          tx-sender 
+          tx-sender
+        )
+      ))
+
+      (ok true)
+    )
+  )
+)
+
 ;; Query functions
 (define-read-only (get-listing-info (listing-id uint))
   (begin
@@ -277,4 +379,11 @@
   (buyer principal)
 )
   (map-get? offers { listing-id: listing-id, buyer: buyer })
+)
+
+(define-read-only (get-refund-status
+  (listing-id uint) 
+  (buyer principal)
+)
+  (map-get? refunds { listing-id: listing-id, buyer: buyer })
 )
