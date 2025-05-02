@@ -1,13 +1,22 @@
-;; Stage 1: Basic marketplace data structure and listing creation
+;; Stage 2: Enhanced marketplace with offer functionality
 (define-constant ADMIN tx-sender)
 (define-constant ERROR-NOT-PERMITTED (err u403))
 (define-constant ERROR-ITEM-NOT-FOUND (err u404))
+(define-constant ERROR-BIDDING-ENDED (err u405))
+(define-constant ERROR-BID-TOO-LOW (err u406))
+(define-constant ERROR-SALE-IN-PROGRESS (err u407))
 (define-constant ERROR-BAD-INPUT (err u409))
 
 ;; Status codes for marketplace items
 (define-constant STATUS-DRAFT u0)
 (define-constant STATUS-LIVE u1)
 (define-constant STATUS-FINISHED u2)
+(define-constant STATUS-REVOKED u3)
+
+;; System parameters
+(define-constant MIN-PRICE-INCREASE u10)
+(define-constant MAX-LISTING-BLOCKS u144000) ;; Approximately 1000 days
+(define-constant MIN-LISTING-BLOCKS u1440) ;; Approximately 10 days
 
 ;; Marketplace listings storage
 (define-map listings 
@@ -27,12 +36,31 @@
   }
 )
 
+;; Offer history
+(define-map offers
+  { listing-id: uint, buyer: principal }
+  { 
+    amount: uint,
+    block-height: uint
+  }
+)
+
 ;; Listing counter
 (define-data-var listing-counter uint u0)
 
-;; Check if listing exists
-(define-private (listing-exists? (id uint))
-  (is-some (map-get? listings { listing-id: id }))
+;; Check if price increase is sufficient
+(define-private (is-enough-increase 
+  (current-amount uint) 
+  (new-amount uint)
+)
+  (let 
+    (
+      (required-increase (+ current-amount 
+        (/ (* current-amount MIN-PRICE-INCREASE) u100)
+      ))
+    )
+    (>= new-amount required-increase)
+  )
 )
 
 ;; Verify listing configuration
@@ -45,10 +73,17 @@
   (and
     (> base-price u0)
     (< open-block close-block)
+    (<= (- close-block open-block) MAX-LISTING-BLOCKS)
+    (>= (- close-block open-block) MIN-LISTING-BLOCKS)
     (match min-acceptable
       price-floor (> price-floor base-price)
       true)
   )
+)
+
+;; Check if listing exists
+(define-private (listing-exists? (id uint))
+  (is-some (map-get? listings { listing-id: id }))
 )
 
 ;; Create new marketplace listing
@@ -104,6 +139,115 @@
   )
 )
 
+;; Submit an offer
+(define-public (submit-offer
+  (listing-id uint)
+  (offer-amount uint)
+  (current-block uint)
+)
+  (begin
+    ;; Verify listing exists
+    (asserts! (listing-exists? listing-id) ERROR-ITEM-NOT-FOUND)
+    
+    (let 
+      (
+        (listing (unwrap! 
+          (map-get? listings { listing-id: listing-id }) 
+          ERROR-ITEM-NOT-FOUND
+        ))
+        (current-top (get top-offer listing))
+        (validated-id listing-id)
+      )
+      ;; Check listing is active
+      (asserts! 
+        (is-eq (get status listing) STATUS-LIVE) 
+        ERROR-BIDDING-ENDED
+      )
+      (asserts! 
+        (< current-block (get close-block listing)) 
+        ERROR-BIDDING-ENDED
+      )
+
+      ;; Check offer meets minimum increase
+      (asserts! 
+        (is-enough-increase current-top offer-amount) 
+        ERROR-BID-TOO-LOW
+      )
+
+      ;; Check against reserve price if set
+      (match (get min-acceptable listing)
+        min-price (asserts! (>= offer-amount min-price) ERROR-BID-TOO-LOW)
+        true
+      )
+
+      ;; Update listing with new top offer
+      (map-set listings 
+        { listing-id: validated-id }
+        (merge listing {
+          top-offer: offer-amount,
+          top-buyer: (some tx-sender)
+        })
+      )
+
+      ;; Record the offer
+      (map-set offers
+        { listing-id: validated-id, buyer: tx-sender }
+        { 
+          amount: offer-amount,
+          block-height: current-block
+        }
+      )
+
+      (ok true)
+    )
+  )
+)
+
+;; Start accepting offers
+(define-public (open-for-offers 
+  (listing-id uint)
+  (current-block uint)
+)
+  (begin
+    ;; Verify listing exists
+    (asserts! (listing-exists? listing-id) ERROR-ITEM-NOT-FOUND)
+    
+    (let 
+      (
+        (listing (unwrap! 
+          (map-get? listings { listing-id: listing-id }) 
+          ERROR-ITEM-NOT-FOUND
+        ))
+        (validated-id listing-id)
+      )
+      ;; Verify seller authorization
+      (asserts! 
+        (is-eq tx-sender (get seller listing)) 
+        ERROR-NOT-PERMITTED
+      )
+      ;; Verify correct state
+      (asserts! 
+        (is-eq (get status listing) STATUS-DRAFT) 
+        ERROR-SALE-IN-PROGRESS
+      )
+      (asserts! 
+        (>= current-block (get open-block listing)) 
+        ERROR-ITEM-NOT-FOUND
+      )
+
+      ;; Change status to live
+      (map-set listings
+        { listing-id: validated-id }
+        (merge listing {
+          status: STATUS-LIVE
+        })
+      )
+
+      (ok true)
+    )
+  )
+)
+
 ;; Query functions
 (define-read-only (get-listing-info (listing-id uint))
   (begin
@@ -126,4 +270,11 @@
       none
     )
   )
+)
+
+(define-read-only (get-offer-info 
+  (listing-id uint)
+  (buyer principal)
+)
+  (map-get? offers { listing-id: listing-id, buyer: buyer })
 )
